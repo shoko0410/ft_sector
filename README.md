@@ -38,6 +38,22 @@ python -m sector.pipeline.build \
   --primary-listing-only
 ```
 
+## Run yearly historical backfill (free-source mode)
+
+```bash
+python -m sector.pipeline.backfill_yearly \
+  --start-year 2010 \
+  --end-year 2026 \
+  --month-day 12-31
+```
+
+Outputs are organized by `as_of` year under `data/model_ready/yearly/<YYYY-MM-DD>/`.
+
+Notes for free-source history:
+- US uses iShares Russell holdings endpoint with `asOfDate` + short lookback.
+- KR uses KRX constituents and WiseIndex WICS history with short lookback.
+- JP uses a free proxy mode (`topix500_proxy`) for historical years.
+
 ## Quality checks
 
 ```bash

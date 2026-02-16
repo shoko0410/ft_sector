@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, date
+from datetime import UTC, datetime, date, timedelta
 from http.client import HTTPResponse, IncompleteRead
 from pathlib import Path
 from typing import cast
@@ -27,11 +27,12 @@ DEFAULT_RETRIES = 3
 DEFAULT_THROTTLE_SECONDS = 0.5
 USER_AGENT = "Mozilla/5.0 (compatible; ft-sector-collector/1.0)"
 FT_AJAX_UPDATE_RESULTS_URL = "https://markets.ft.com/data/equities/ajax/updateScreenerResults"
-US_IWV_HOLDINGS_CSV_URL = (
+US_IWV_HOLDINGS_CSV_BASE_URL = (
     "https://www.ishares.com/us/products/239714/"
     "ishares-russell-3000-etf/1467271812596.ajax"
-    "?fileType=csv&fileName=IWV_holdings&dataType=fund"
 )
+US_IWV_HOLDINGS_QUERY = "fileType=csv&fileName=IWV_holdings&dataType=fund"
+US_IWV_MAX_LOOKBACK_DAYS = 10
 JPX_TOPIX_WEIGHT_CSV_URL = "https://www.jpx.co.jp/automation/english/markets/indices/topix/files/topixweight_e.csv"
 
 TOPIX500_SERIES_CODES = {
@@ -365,13 +366,11 @@ def _map_us_membership_sector_to_icb_l1(sector_name: str) -> str:
     return US_MEMBERSHIP_SECTOR_TO_ICB_L1.get(sector_name.strip(), "")
 
 
-def _load_us_russell3000_membership(options: CollectorOptions) -> MembershipFilter:
-    raw_csv = _fetch_with_retry(
-        url=US_IWV_HOLDINGS_CSV_URL,
-        retries=options.retries,
-        timeout_seconds=options.timeout,
-        throttle_seconds=options.throttle,
-    )
+def _build_us_iwv_holdings_url(as_of_yyyymmdd: str) -> str:
+    return f"{US_IWV_HOLDINGS_CSV_BASE_URL}?{US_IWV_HOLDINGS_QUERY}&asOfDate={as_of_yyyymmdd}"
+
+
+def _parse_us_iwv_holdings_csv(raw_csv: str) -> pd.DataFrame:
     marker = "\nTicker,Name,Sector,Asset Class"
     idx = raw_csv.find(marker)
     if idx == -1:
@@ -382,13 +381,46 @@ def _load_us_russell3000_membership(options: CollectorOptions) -> MembershipFilt
     missing = sorted(required_columns.difference(frame.columns))
     if missing:
         raise RuntimeError("iShares holdings csv missing columns: " + ",".join(missing))
+    return frame
 
-    asset_class = cast(pd.Series, frame["Asset Class"]).astype(str).str.strip().str.lower()
-    equity_rows = cast(pd.DataFrame, frame[asset_class == "equity"].copy())
-    location_series = cast(pd.Series, equity_rows["Location"]).astype(str).str.strip().str.lower()
-    equity_rows = cast(pd.DataFrame, equity_rows[location_series == "united states"].copy())
-    if equity_rows.empty:
-        raise RuntimeError("iShares holdings csv did not contain US equity rows")
+
+def _fetch_us_iwv_equity_rows(options: CollectorOptions) -> tuple[pd.DataFrame, str]:
+    as_of_date = date.fromisoformat(options.as_of)
+    last_error: RuntimeError | None = None
+    for offset in range(US_IWV_MAX_LOOKBACK_DAYS + 1):
+        candidate = as_of_date - timedelta(days=offset)
+        candidate_date = candidate.strftime("%Y%m%d")
+        candidate_url = _build_us_iwv_holdings_url(candidate_date)
+        try:
+            raw_csv = _fetch_with_retry(
+                url=candidate_url,
+                retries=options.retries,
+                timeout_seconds=options.timeout,
+                throttle_seconds=options.throttle,
+            )
+            frame = _parse_us_iwv_holdings_csv(raw_csv)
+        except RuntimeError as exc:
+            last_error = exc
+            continue
+
+        asset_class = cast(pd.Series, frame["Asset Class"]).astype(str).str.strip().str.lower()
+        equity_rows = cast(pd.DataFrame, frame[asset_class == "equity"].copy())
+        location_series = cast(pd.Series, equity_rows["Location"]).astype(str).str.strip().str.lower()
+        equity_rows = cast(pd.DataFrame, equity_rows[location_series == "united states"].copy())
+        if not equity_rows.empty:
+            return equity_rows, candidate_url
+
+    if last_error is not None:
+        raise RuntimeError(
+            f"failed to fetch IWV holdings within lookback={US_IWV_MAX_LOOKBACK_DAYS}: {last_error}"
+        ) from last_error
+    raise RuntimeError(
+        f"IWV holdings did not contain US equity rows within lookback={US_IWV_MAX_LOOKBACK_DAYS}"
+    )
+
+
+def _load_us_russell3000_membership(options: CollectorOptions) -> MembershipFilter:
+    equity_rows, source_url = _fetch_us_iwv_equity_rows(options)
 
     stock_codes: set[str] = set()
     preferred_exchange_codes: dict[str, set[str]] = {}
@@ -415,11 +447,70 @@ def _load_us_russell3000_membership(options: CollectorOptions) -> MembershipFilt
         raise RuntimeError("iShares holdings csv produced empty Russell membership set")
 
     return MembershipFilter(
-        source_name=US_IWV_HOLDINGS_CSV_URL,
+        source_name=source_url,
         stock_codes=stock_codes,
         preferred_exchange_codes=preferred_exchange_codes,
         level1_hints=level1_hints,
     )
+
+
+def _collect_us_russell3000_from_iwv(options: CollectorOptions) -> tuple[pd.DataFrame, dict[str, object]]:
+    equity_rows, source_url = _fetch_us_iwv_equity_rows(options)
+    records = cast(list[dict[str, object]], equity_rows.to_dict(orient="records"))
+
+    seen_stock_codes: set[str] = set()
+    collected: list[dict[str, object]] = []
+    for row in records:
+        stock_code = _normalize_stock_code(str(row.get("Ticker", "")))
+        stock_code_key = _canonical_stock_code(stock_code)
+        if not stock_code_key or stock_code == "-":
+            continue
+        if stock_code_key in seen_stock_codes:
+            continue
+
+        exchange_codes = sorted(_map_us_exchange_name_to_ft_codes(str(row.get("Exchange", ""))))
+        exchange_code = exchange_codes[0] if exchange_codes else "NSQ"
+        sector_hint = _map_us_membership_sector_to_icb_l1(str(row.get("Sector", "")))
+        sector_value = str(row.get("Sector", "")).strip()
+        if sector_value:
+            native_level3 = sector_value
+        elif sector_hint:
+            native_level3 = sector_hint
+        else:
+            native_level3 = "ICB_L3_UNCERTAIN"
+
+        seen_stock_codes.add(stock_code_key)
+        collected.append(
+            {
+                "as_of_date": options.as_of,
+                "market": "us",
+                "universe_scope": options.universe_scope,
+                "ticker": f"{stock_code}:{exchange_code}",
+                "stock_code": stock_code,
+                "exchange_code": exchange_code,
+                "stock_name": str(row.get("Name", "")).strip() or stock_code,
+                "country_label": "United States",
+                "native_taxonomy_level1": sector_hint,
+                "native_taxonomy_label": native_level3,
+                "tearsheet_url": source_url,
+            }
+        )
+
+    frame = pd.DataFrame(collected)
+    if not frame.empty:
+        frame = frame.sort_values(["ticker"], kind="stable").reset_index(drop=True)
+
+    stats: dict[str, object] = {
+        "pages_fetched": 0,
+        "max_page_seen": 0,
+        "target_rows": int(len(frame)),
+        "constituent_rows": int(len(frame)),
+        "constituent_unique_stock_codes": int(len(frame)),
+        "membership_size": int(len(frame)),
+        "membership_source": source_url,
+        "membership_coverage_ratio": 1.0,
+    }
+    return frame, stats
 
 
 def _load_jp_topix500_membership(options: CollectorOptions) -> MembershipFilter:
@@ -872,6 +963,7 @@ def _collect_market_constituents(
 def _run_collection(options: CollectorOptions) -> tuple[int, JsonDict]:
     market = options.market
     config = MARKET_CONFIGS[market]
+    use_us_iwv_source = market == "us" and options.universe_scope == "russell3000"
     output_dir = BASE_OUTPUT_DIR / options.as_of / market
     metadata_path = output_dir / "run_metadata.json"
     results_path = output_dir / "results_page_1.html"
@@ -900,39 +992,83 @@ def _run_collection(options: CollectorOptions) -> tuple[int, JsonDict]:
     }
 
     try:
-        if results_path.exists() and not options.force:
-            results_html = results_path.read_text(encoding="utf-8")
-            metadata["checkpoint_hit"] = True
-            metadata["results_url"] = "checkpoint://results_page_1.html"
+        if use_us_iwv_source:
+            parsed_results = {"parser_mode": "iwv-csv"}
+            constituents, collect_stats = _collect_us_russell3000_from_iwv(options)
+            _write_parquet(constituents_path, constituents)
+            metadata["results_url"] = "source://ishares-iwv-csv"
+            metadata["membership_source"] = str(collect_stats["membership_source"])
+            membership_size_obj = collect_stats.get("membership_size", 0)
+            if isinstance(membership_size_obj, (int, float)):
+                membership_size = int(float(membership_size_obj))
+            elif isinstance(membership_size_obj, str):
+                try:
+                    membership_size = int(membership_size_obj)
+                except ValueError:
+                    membership_size = 0
+            else:
+                membership_size = 0
+            metadata["membership_size"] = membership_size
+            membership_filter = None
         else:
-            selected_url, results_html = _fetch_first_available(
-                urls=config.results_urls,
-                retries=options.retries,
-                timeout_seconds=options.timeout,
-                throttle_seconds=options.throttle,
-            )
-            _write_text(results_path, results_html)
-            metadata["results_url"] = selected_url
-            _ = time.sleep(options.throttle)
+            if results_path.exists() and not options.force:
+                results_html = results_path.read_text(encoding="utf-8")
+                metadata["checkpoint_hit"] = True
+                metadata["results_url"] = "checkpoint://results_page_1.html"
+            else:
+                selected_url, results_html = _fetch_first_available(
+                    urls=config.results_urls,
+                    retries=options.retries,
+                    timeout_seconds=options.timeout,
+                    throttle_seconds=options.throttle,
+                )
+                _write_text(results_path, results_html)
+                metadata["results_url"] = selected_url
+                _ = time.sleep(options.throttle)
 
-        parsed_results = _parse_page(results_html, parser_name=options.parser)
-        membership_filter = _resolve_membership_filter(market=market, scope=options.universe_scope, options=options)
-        metadata["membership_source"] = membership_filter.source_name if membership_filter is not None else "none"
-        metadata["membership_size"] = len(membership_filter.stock_codes) if membership_filter is not None else 0
+            parsed_results = _parse_page(results_html, parser_name=options.parser)
+            membership_filter = _resolve_membership_filter(market=market, scope=options.universe_scope, options=options)
+            metadata["membership_source"] = membership_filter.source_name if membership_filter is not None else "none"
+            metadata["membership_size"] = len(membership_filter.stock_codes) if membership_filter is not None else 0
 
-        if constituents_path.exists() and not options.force:
-            existing = pd.read_parquet(constituents_path)
-            constituents = cast(pd.DataFrame, existing)
-            cached_unique_codes = (
-                cast(pd.Series, constituents["stock_code"]).astype(str).map(_canonical_stock_code).nunique()
-                if not constituents.empty
-                else 0
-            )
-            required_codes = options.target_rows
-            if membership_filter is not None and membership_filter.stock_codes:
-                required_codes = max(1, int(len(membership_filter.stock_codes) * 0.98))
-            metadata["constituents_checkpoint_hit"] = bool(cached_unique_codes >= required_codes)
-            if cached_unique_codes < required_codes:
+            if constituents_path.exists() and not options.force:
+                existing = pd.read_parquet(constituents_path)
+                constituents = cast(pd.DataFrame, existing)
+                cached_unique_codes = (
+                    cast(pd.Series, constituents["stock_code"]).astype(str).map(_canonical_stock_code).nunique()
+                    if not constituents.empty
+                    else 0
+                )
+                required_codes = options.target_rows
+                if membership_filter is not None and membership_filter.stock_codes:
+                    required_codes = max(1, int(len(membership_filter.stock_codes) * 0.98))
+                metadata["constituents_checkpoint_hit"] = bool(cached_unique_codes >= required_codes)
+                if cached_unique_codes < required_codes:
+                    constituents, collect_stats = _collect_market_constituents(
+                        market=market,
+                        results_html=results_html,
+                        config=config,
+                        options=options,
+                        referer=str(metadata["results_url"]),
+                        membership_filter=membership_filter,
+                    )
+                    _write_parquet(constituents_path, constituents)
+                else:
+                    collect_stats = {
+                        "pages_fetched": 0,
+                        "max_page_seen": 0,
+                        "target_rows": options.target_rows,
+                        "constituent_rows": int(len(constituents)),
+                        "constituent_unique_stock_codes": int(cached_unique_codes),
+                        "membership_size": len(membership_filter.stock_codes) if membership_filter is not None else 0,
+                        "membership_source": membership_filter.source_name if membership_filter is not None else "none",
+                        "membership_coverage_ratio": (
+                            (cached_unique_codes / len(membership_filter.stock_codes))
+                            if membership_filter is not None and membership_filter.stock_codes
+                            else 1.0
+                        ),
+                    }
+            else:
                 constituents, collect_stats = _collect_market_constituents(
                     market=market,
                     results_html=results_html,
@@ -942,31 +1078,6 @@ def _run_collection(options: CollectorOptions) -> tuple[int, JsonDict]:
                     membership_filter=membership_filter,
                 )
                 _write_parquet(constituents_path, constituents)
-            else:
-                collect_stats = {
-                    "pages_fetched": 0,
-                    "max_page_seen": 0,
-                    "target_rows": options.target_rows,
-                    "constituent_rows": int(len(constituents)),
-                    "constituent_unique_stock_codes": int(cached_unique_codes),
-                    "membership_size": len(membership_filter.stock_codes) if membership_filter is not None else 0,
-                    "membership_source": membership_filter.source_name if membership_filter is not None else "none",
-                    "membership_coverage_ratio": (
-                        (cached_unique_codes / len(membership_filter.stock_codes))
-                        if membership_filter is not None and membership_filter.stock_codes
-                        else 1.0
-                    ),
-                }
-        else:
-            constituents, collect_stats = _collect_market_constituents(
-                market=market,
-                results_html=results_html,
-                config=config,
-                options=options,
-                referer=str(metadata["results_url"]),
-                membership_filter=membership_filter,
-            )
-            _write_parquet(constituents_path, constituents)
 
         if len(constituents) == 0:
             raise RuntimeError(f"no FT constituents collected for market={market}")
@@ -1004,18 +1115,21 @@ def _run_collection(options: CollectorOptions) -> tuple[int, JsonDict]:
         sample_url = str(constituents.iloc[0]["tearsheet_url"])
         metadata["tearsheet_url"] = sample_url
 
-        if tearsheet_path.exists() and not options.force:
-            tearsheet_html = tearsheet_path.read_text(encoding="utf-8")
+        if use_us_iwv_source:
+            parsed_tearsheet = {"parser_mode": "iwv-csv", "skipped": True}
         else:
-            tearsheet_html = _fetch_with_retry(
-                url=sample_url,
-                retries=options.retries,
-                timeout_seconds=options.timeout,
-                throttle_seconds=options.throttle,
-            )
-            _write_text(tearsheet_path, tearsheet_html)
+            if tearsheet_path.exists() and not options.force:
+                tearsheet_html = tearsheet_path.read_text(encoding="utf-8")
+            else:
+                tearsheet_html = _fetch_with_retry(
+                    url=sample_url,
+                    retries=options.retries,
+                    timeout_seconds=options.timeout,
+                    throttle_seconds=options.throttle,
+                )
+                _write_text(tearsheet_path, tearsheet_html)
 
-        parsed_tearsheet = _parse_page(tearsheet_html, parser_name=options.parser)
+            parsed_tearsheet = _parse_page(tearsheet_html, parser_name=options.parser)
         metadata["parse_summary"] = {
             "results": parsed_results,
             "tearsheet": parsed_tearsheet,

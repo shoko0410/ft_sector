@@ -1,8 +1,15 @@
-# pyright: reportMissingImports=false,reportMissingTypeStubs=false,reportUnknownVariableType=false,reportUnknownMemberType=false,reportUnknownArgumentType=false
+# pyright: reportMissingImports=false,reportMissingTypeStubs=false,reportUnknownVariableType=false,reportUnknownMemberType=false,reportUnknownArgumentType=false,reportPrivateUsage=false
+import pandas as pd
+import pytest
+
+from sector.collect import ft
 from sector.collect.ft import _extract_last_page
 from sector.collect.ft import _canonical_stock_code
+from sector.collect.ft import _build_us_iwv_holdings_url
+from sector.collect.ft import _collect_us_russell3000_from_iwv
 from sector.collect.ft import _extract_tearsheet_taxonomy
 from sector.collect.ft import _map_us_exchange_name_to_ft_codes
+from sector.collect.ft import _parse_us_iwv_holdings_csv
 from sector.collect.ft import _parse_ajax_rows
 from sector.collect.ft import _split_ft_ticker
 from sector.collect.ft import _target_rows_for_scope
@@ -83,3 +90,59 @@ def test_extract_last_page_reads_pagination_numbers() -> None:
         '<button class="o-buttons mod-ui-pagination__number" data-mod-pagination-num="150" type="button">150</button>'
     )
     assert _extract_last_page(fragment, current_page=1) == 150
+
+
+def test_build_us_iwv_holdings_url_includes_as_of_date() -> None:
+    url = _build_us_iwv_holdings_url("20160331")
+    assert "asOfDate=20160331" in url
+    assert "fileName=IWV_holdings" in url
+
+
+def test_parse_us_iwv_holdings_csv_reads_table_after_metadata() -> None:
+    raw_csv = (
+        "Fund Holdings as of,\"Mar 31, 2016\"\n"
+        "Some Header,Value\n"
+        "Ticker,Name,Sector,Asset Class,Market Value,Weight (%),Notional Value,Quantity,CUSIP,ISIN,SEDOL,Price,Location,Exchange,Currency,FX Rate,Accrual Date\n"
+        "AAPL,Apple Inc,Information Technology,Equity,1,2,3,4,5,6,7,8,United States,NASDAQ,USD,1,\n"
+    )
+    frame = _parse_us_iwv_holdings_csv(raw_csv)
+    assert list(frame.columns)[:4] == ["Ticker", "Name", "Sector", "Asset Class"]
+    assert str(frame.iloc[0]["Ticker"]) == "AAPL"
+
+
+def test_collect_us_russell3000_from_iwv_builds_constituent_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    sample = pd.DataFrame(
+        [
+            {
+                "Ticker": "AAPL",
+                "Name": "Apple Inc",
+                "Sector": "Information Technology",
+                "Asset Class": "Equity",
+                "Exchange": "NASDAQ",
+                "Location": "United States",
+            }
+        ]
+    )
+
+    def _fake_fetch(options: ft.CollectorOptions) -> tuple[pd.DataFrame, str]:
+        _ = options
+        return sample, "https://example.test/iwv.csv?asOfDate=20160331"
+
+    monkeypatch.setattr(ft, "_fetch_us_iwv_equity_rows", _fake_fetch)
+
+    options = ft.CollectorOptions(
+        market="us",
+        as_of="2016-03-31",
+        parser="js-engine",
+        universe_scope="russell3000",
+        target_rows=3000,
+        timeout=10.0,
+        retries=1,
+        throttle=0.0,
+        force=False,
+    )
+    frame, stats = _collect_us_russell3000_from_iwv(options)
+    assert int(len(frame)) == 1
+    assert str(frame.iloc[0]["ticker"]).startswith("AAPL:")
+    assert str(frame.iloc[0]["native_taxonomy_level1"]) == "Technology"
+    assert str(stats["membership_source"]).startswith("https://example.test")

@@ -33,6 +33,23 @@ KRX_REFERER_URL = "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd
 KRX_INDEX_FINDER_BLD = "dbms/comm/finder/finder_equidx"
 KRX_CONSTITUENTS_BLD = "dbms/MDC/STAT/standard/MDCSTAT00601"
 KRX_MAX_LOOKBACK_DAYS = 7
+WISEINDEX_TREE_URL = "https://www.wiseindex.com/API/Tree/Get?id=4"
+WISEINDEX_COMPONENTS_URL = "https://www.wiseindex.com/Index/GetIndexComponets"
+WISEINDEX_TREE_ROOT_KEY = "0000004"
+WISEINDEX_WICS_NODE_KEY = "0000010021"
+WISEINDEX_MAX_LOOKBACK_DAYS = 10
+WISEINDEX_SECTOR_LABELS = {
+    "G10": "에너지",
+    "G15": "소재",
+    "G20": "산업재",
+    "G25": "경기관련소비재",
+    "G30": "필수소비재",
+    "G35": "건강관리",
+    "G40": "금융",
+    "G45": "IT",
+    "G50": "커뮤니케이션서비스",
+    "G55": "유틸리티",
+}
 KRX_INDEX_NAME_HINTS = {
     "kospi200": ("코스피200", "코스피 200", "KOSPI200", "KOSPI 200"),
     "kosdaq150": ("코스닥150", "코스닥 150", "KOSDAQ150", "KOSDAQ 150"),
@@ -48,6 +65,7 @@ class CollectorOptions:
     throttle: float
     force_naver_fail: bool
     max_null_rate: float
+    allow_local_fallback: bool
 
 
 def _utc_now_iso() -> str:
@@ -198,6 +216,141 @@ def _fetch_json_with_retry(
     raise RuntimeError(f"request failed after {retries} attempts: {last_error}") from last_error
 
 
+def _load_wiseindex_sector_codes(options: CollectorOptions) -> tuple[str, ...]:
+    tree_text = _fetch_with_retry(
+        url=WISEINDEX_TREE_URL,
+        retries=options.retries,
+        timeout_seconds=options.timeout,
+        throttle_seconds=options.throttle,
+    )
+    payload_obj = cast(object, json.loads(tree_text))
+    if not isinstance(payload_obj, list):
+        raise RuntimeError("WiseIndex tree response was not a list")
+
+    root_node: dict[str, object] | None = None
+    for row_obj in payload_obj:
+        if not isinstance(row_obj, dict):
+            continue
+        row = cast(dict[str, object], row_obj)
+        if str(row.get("key", "")) == WISEINDEX_TREE_ROOT_KEY:
+            root_node = row
+            break
+    if root_node is None:
+        raise RuntimeError("WiseIndex tree missing Wise Sector root")
+
+    root_children = root_node.get("children")
+    if not isinstance(root_children, list):
+        raise RuntimeError("WiseIndex tree root missing children")
+
+    wics_node: dict[str, object] | None = None
+    for row_obj in root_children:
+        if not isinstance(row_obj, dict):
+            continue
+        row = cast(dict[str, object], row_obj)
+        if str(row.get("key", "")) == WISEINDEX_WICS_NODE_KEY:
+            wics_node = row
+            break
+    if wics_node is None:
+        raise RuntimeError("WiseIndex tree missing WICS node")
+
+    wics_children = wics_node.get("children")
+    if not isinstance(wics_children, list):
+        raise RuntimeError("WiseIndex WICS node missing children")
+
+    sector_codes: set[str] = set()
+    for level3_obj in wics_children:
+        if not isinstance(level3_obj, dict):
+            continue
+        level3 = cast(dict[str, object], level3_obj)
+        level4_children = level3.get("children")
+        if not isinstance(level4_children, list):
+            continue
+        for level4_obj in level4_children:
+            if not isinstance(level4_obj, dict):
+                continue
+            key = str(cast(dict[str, object], level4_obj).get("key", "")).strip().upper()
+            if key.startswith("G") and len(key) == 5:
+                sector_codes.add(key)
+
+    if not sector_codes:
+        raise RuntimeError("WiseIndex tree did not provide WICS sector codes")
+    return tuple(sorted(sector_codes))
+
+
+def _fetch_wiseindex_components(
+    *,
+    sec_cd: str,
+    dt_yyyymmdd: str,
+    options: CollectorOptions,
+) -> tuple[list[dict[str, object]], str]:
+    params = urlencode({"ceil_yn": "0", "dt": dt_yyyymmdd, "sec_cd": sec_cd})
+    url = f"{WISEINDEX_COMPONENTS_URL}?{params}"
+    payload_text = _fetch_with_retry(
+        url=url,
+        retries=options.retries,
+        timeout_seconds=options.timeout,
+        throttle_seconds=options.throttle,
+    )
+    payload_obj = cast(object, json.loads(payload_text))
+    if not isinstance(payload_obj, dict):
+        raise RuntimeError(f"WiseIndex components response was not an object for sec_cd={sec_cd}")
+    list_obj = payload_obj.get("list")
+    if not isinstance(list_obj, list):
+        return [], url
+    rows: list[dict[str, object]] = []
+    for row_obj in list_obj:
+        if isinstance(row_obj, dict):
+            rows.append(cast(dict[str, object], row_obj))
+    return rows, url
+
+
+def _extract_wiseindex_sector_label(row: Mapping[str, object], sec_cd: str) -> str:
+    sec_name = str(row.get("SEC_NM_KOR", "")).strip()
+    if sec_name:
+        return sec_name
+
+    idx_name = str(row.get("IDX_NM_KOR", "")).strip()
+    if idx_name:
+        cleaned = idx_name.replace("WICS", "").strip()
+        if cleaned:
+            return cleaned
+
+    return WISEINDEX_SECTOR_LABELS.get(sec_cd[:3], f"WICS_{sec_cd}")
+
+
+def _fetch_wiseindex_wics_map(
+    *,
+    as_of: str,
+    options: CollectorOptions,
+) -> tuple[dict[str, tuple[str, str]], str]:
+    sector_codes = _load_wiseindex_sector_codes(options)
+    as_of_date = date.fromisoformat(as_of)
+    last_error: RuntimeError | None = None
+    for offset in range(WISEINDEX_MAX_LOOKBACK_DAYS + 1):
+        candidate_date = (as_of_date - timedelta(days=offset)).strftime("%Y%m%d")
+        by_stock: dict[str, tuple[str, str]] = {}
+        for sec_cd in sector_codes:
+            try:
+                rows, url = _fetch_wiseindex_components(sec_cd=sec_cd, dt_yyyymmdd=candidate_date, options=options)
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+            for row in rows:
+                stock_code = str(row.get("CMP_CD", "")).strip().zfill(6)
+                if not stock_code or stock_code == "000000":
+                    continue
+                sector_label = _extract_wiseindex_sector_label(row, sec_cd)
+                by_stock[stock_code] = (sector_label, url)
+        if by_stock:
+            return by_stock, candidate_date
+
+    if last_error is not None:
+        raise RuntimeError(
+            f"WiseIndex WICS retrieval failed within lookback={WISEINDEX_MAX_LOOKBACK_DAYS}: {last_error}"
+        ) from last_error
+    raise RuntimeError(f"WiseIndex WICS returned empty map within lookback={WISEINDEX_MAX_LOOKBACK_DAYS}")
+
+
 def _fixture_constituents() -> dict[str, list[dict[str, str]]]:
     return {
         "kospi200": [
@@ -325,6 +478,8 @@ def _build_constituents(indices: tuple[str, ...], as_of: str, options: Collector
         try:
             index_items = _fetch_krx_constituents(index_name=index_name, as_of=as_of, options=options)
         except RuntimeError as exc:
+            if not options.allow_local_fallback:
+                raise
             index_items = fixture[index_name]
             constituent_source = "local_fallback"
             source_error = str(exc)
@@ -400,14 +555,27 @@ def _collect_taxonomy(
     )
     name_map = constituents.groupby("stock_code")["stock_name"].first().to_dict()
 
+    wiseindex_map: dict[str, tuple[str, str]] = {}
+    wiseindex_dt: str | None = None
+    wiseindex_error: str | None = None
+    try:
+        wiseindex_map, wiseindex_dt = _fetch_wiseindex_wics_map(as_of=options.as_of, options=options)
+    except RuntimeError as exc:
+        wiseindex_error = str(exc)
+
     taxonomy_rows: list[dict[str, object]] = []
     naver_rows: list[dict[str, object]] = []
     for stock_code in sorted(index_map.keys()):
         stock_name = str(name_map[stock_code])
         source_url: str | None = None
+        source_label: str | None = None
         naver_label: str | None = None
         naver_error: str | None = None
-        if not options.force_naver_fail:
+        wise_entry = wiseindex_map.get(str(stock_code).zfill(6))
+        if wise_entry is not None:
+            source_label = wise_entry[0]
+            source_url = wise_entry[1]
+        elif not options.force_naver_fail:
             try:
                 source_url, naver_label = _fetch_naver_wics(
                     stock_code=stock_code,
@@ -415,13 +583,23 @@ def _collect_taxonomy(
                     timeout_seconds=options.timeout,
                     throttle_seconds=options.throttle,
                 )
+                source_label = naver_label
             except RuntimeError as exc:
                 naver_error = str(exc)
+            time.sleep(options.throttle)
         else:
             naver_error = "forced by --force-naver-fail"
 
-        taxonomy_source = "naver_wics_primary" if naver_label else "krx_fallback"
-        native_taxonomy_label = naver_label or _fallback_label(index_map[stock_code])
+        if wise_entry is not None:
+            taxonomy_source = "wiseindex_wics_primary"
+            native_taxonomy_label = str(source_label)
+        elif source_label:
+            taxonomy_source = "naver_wics_primary"
+            native_taxonomy_label = source_label
+        else:
+            taxonomy_source = "krx_fallback"
+            native_taxonomy_label = _fallback_label(index_map[stock_code])
+
         taxonomy_rows.append(
             {
                 "as_of_date": options.as_of,
@@ -437,14 +615,14 @@ def _collect_taxonomy(
                 "as_of_date": options.as_of,
                 "stock_code": stock_code,
                 "stock_name": stock_name,
-                "wics_label": naver_label,
+                "wics_label": source_label,
                 "taxonomy_source": taxonomy_source,
                 "source_url": source_url,
-                "error": naver_error,
+                "error": naver_error or wiseindex_error,
+                "wiseindex_dt": wiseindex_dt,
                 "source_ts": _utc_now_iso(),
             }
         )
-        time.sleep(options.throttle)
 
     taxonomy_frame = pd.DataFrame(taxonomy_rows)
     naver_frame = pd.DataFrame(naver_rows)
@@ -519,6 +697,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = parser.add_argument("--throttle", type=float, default=DEFAULT_THROTTLE_SECONDS)
     _ = parser.add_argument("--max-null-rate", type=float, default=DEFAULT_MAX_NULL_RATE)
     _ = parser.add_argument("--force-naver-fail", action="store_true")
+    _ = parser.add_argument("--no-local-fallback", action="store_true")
     return parser
 
 
@@ -539,6 +718,7 @@ def main(argv: list[str] | None = None) -> int:
         throttle=cast(float, args.throttle),
         force_naver_fail=cast(bool, args.force_naver_fail),
         max_null_rate=cast(float, args.max_null_rate),
+        allow_local_fallback=not cast(bool, args.no_local_fallback),
     )
     try:
         return _run_collection(options)
