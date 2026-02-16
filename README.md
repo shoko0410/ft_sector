@@ -79,3 +79,9 @@ gh repo create <repo-name> --private --source=. --remote=origin --push
 git remote add origin https://github.com/<your-id>/<repo-name>.git
 git push -u origin main
 ```
+
+Windows PowerShell helper (after `gh auth login`):
+
+```powershell
+.\scripts\publish_github.ps1 -RepoName <repo-name> -Visibility private
+```
