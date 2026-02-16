@@ -1,0 +1,19 @@
+{
+  "source_policy": {
+    "us": "ft",
+    "jp": "ft",
+    "kr": "free_source"
+  },
+  "universes": {
+    "us": [
+      "russell3000"
+    ],
+    "kr": [
+      "kospi200",
+      "kosdaq150"
+    ],
+    "jp": [
+      "topix500"
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "contract_version": "1.0",
+  "output_schema": {
+    "fields": [
+      "security_id",
+      "ticker",
+      "country",
+      "native_taxonomy_label",
+      "icb_proxy_level1",
+      "icb_proxy_level3"
+    ]
+  },
+  "proxy_quality_thresholds": {
+    "max_unknown_ratio": 0.1,
+    "min_high_confidence_ratio": 0.7,
+    "max_low_confidence_ratio": 0.15
+  }
+}
